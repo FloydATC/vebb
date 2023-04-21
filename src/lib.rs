@@ -9,6 +9,8 @@ use std::net::{SocketAddr, TcpListener, TcpStream, Shutdown};
 pub use http::{Request, Response, StatusCode, Method, HeaderName, HeaderValue, HeaderMap};
 pub use bytes::Bytes;
 
+type ReqBuilder = http::request::Builder;
+
 const MAX_LINE_LENGTH: u64 = 32768;
 const MAX_REQ_HEADER_COUNT: usize = 1024;
 
@@ -121,7 +123,7 @@ impl Connection {
     }
 
 
-    fn send_response(&mut self, response: Response<Bytes>) -> Result<(), std::io::Error> {
+    fn send_response<T: Buf>(&mut self, response: Response<T>) -> Result<(), std::io::Error> {
         let (parts, body) = response.into_parts();
         self.send_response_status(&parts.status)?;
         self.send_response_headers(&parts.headers)?;
@@ -149,7 +151,7 @@ impl Connection {
     }
 
 
-    fn send_response_body(&mut self, body: Bytes) -> Result<(), std::io::Error> {
+    fn send_response_body<T: Buf>(&mut self, body: T) -> Result<(), std::io::Error> {
         std::io::copy(&mut body.reader(), &mut self.stream)?;
         return Ok(());
     }
@@ -169,7 +171,7 @@ fn keep_alive_requested(request: &Request<Bytes>) -> bool {
 }
 
 
-fn read_request(reader: &mut BufReader<TcpStream>) -> Result<Option<Request<Bytes>>, StatusCode> {
+fn read_request<R: BufRead>(reader: &mut R) -> Result<Option<Request<Bytes>>, StatusCode> {
     let mut req_builder = Request::builder();
 
     // Get request line, e.g. "HTTP/1.1 GET /index.html"
@@ -194,7 +196,7 @@ fn read_request(reader: &mut BufReader<TcpStream>) -> Result<Option<Request<Byte
 }
 
 
-fn request_content_length(req_builder: &http::request::Builder) -> Option<usize> {
+fn request_content_length(req_builder: &ReqBuilder) -> Option<usize> {
     let key = "Content-Length";
     let opt_value = req_builder.headers_ref().unwrap().get(key);
     if let Some(value) = opt_value {
@@ -206,7 +208,7 @@ fn request_content_length(req_builder: &http::request::Builder) -> Option<usize>
 }
 
 
-fn read_request_body(req_builder: &http::request::Builder, reader: &mut BufReader<TcpStream>) -> Result<Bytes, StatusCode> {
+fn read_request_body<R: BufRead>(req_builder: &ReqBuilder, reader: &mut R) -> Result<Bytes, StatusCode> {
     let mut body = vec![];
 
     if let Some(bytes_to_read) = request_content_length(req_builder) {
@@ -226,11 +228,11 @@ fn read_request_body(req_builder: &http::request::Builder, reader: &mut BufReade
 }
 
 
-fn finalize_request(req_builder: http::request::Builder, body: Bytes) -> Result<Request<Bytes>, StatusCode> {
+fn finalize_request<T>(req_builder: ReqBuilder, body: T) -> Result<Request<T>, StatusCode> {
     let request = match req_builder.body(body) {
         Ok(request) => request,
         Err(error) => {
-            println!("finalize_request() http::request::Builder::body returned {}", error);
+            println!("finalize_request() ReqBuilder::body returned {}", error);
             return Err(StatusCode::BAD_REQUEST);
         }
     };
@@ -238,7 +240,7 @@ fn finalize_request(req_builder: http::request::Builder, body: Bytes) -> Result<
 }
 
 
-fn read_request_headers(mut req_builder: http::request::Builder, reader: &mut BufReader<TcpStream>) -> Result<http::request::Builder, StatusCode>{
+fn read_request_headers<R: BufRead>(mut req_builder: ReqBuilder, reader: &mut R) -> Result<ReqBuilder, StatusCode>{
     loop {
         // Read next HTTP header "Key: Value"
         let header_line = match read_line(reader) {
@@ -266,7 +268,7 @@ fn read_request_headers(mut req_builder: http::request::Builder, reader: &mut Bu
 }
 
 
-fn parse_request_line(req_builder: http::request::Builder, request_line: &Bytes) -> Result<http::request::Builder, StatusCode> {
+fn parse_request_line(req_builder: ReqBuilder, request_line: &Bytes) -> Result<ReqBuilder, StatusCode> {
     if !request_line.is_ascii() { return Err(StatusCode::BAD_REQUEST); }
     let parts = split(&request_line, AsciiChar::Space.as_byte(), 3);
 
@@ -284,9 +286,9 @@ fn parse_request_line(req_builder: http::request::Builder, request_line: &Bytes)
     // Next is the URI, which can be more or less any contiguous ASCII imaginable
     let uri: http::uri::PathAndQuery = match std::str::from_utf8(&parts[1]) {
         Ok(str) => str.parse().unwrap(),
-        Err(error) => {
+        Err(utf_error) => {
             // Should be impossible because we already verified the line is ASCII
-            println!("parse_request_line() bad URI: {}", error);
+            println!("parse_request_line() bad URI: {}", utf_error);
             return Err(StatusCode::BAD_REQUEST);
         }
     };
@@ -342,7 +344,7 @@ fn pretty_case(key: &HeaderName) -> Bytes {
 }
 
 
-fn header_if_missing(response: &mut Response<Bytes>, key: &str, value: &str) {
+fn header_if_missing<T>(response: &mut Response<T>, key: &str, value: &str) {
     let key = HeaderName::from_bytes(key.as_bytes()).unwrap();
     let value = HeaderValue::from_bytes(value.as_bytes()).unwrap();
     if !response.headers().contains_key(&key) {
@@ -351,7 +353,7 @@ fn header_if_missing(response: &mut Response<Bytes>, key: &str, value: &str) {
 }
 
 
-fn read_line(reader: &mut std::io::BufReader<std::net::TcpStream>) -> Result<Bytes,std::io::Error> {
+fn read_line<R: BufRead>(reader: &mut R) -> Result<Bytes, std::io::Error> {
     let mut buffer = vec![];
 
     return match reader.take(MAX_LINE_LENGTH).read_until(AsciiChar::LineFeed.as_byte(), &mut buffer) {
