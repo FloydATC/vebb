@@ -1,50 +1,53 @@
 
+use std::io::BufReader;
 use std::io::prelude::*;
-pub use bytes::Bytes;
 use bytes::BytesMut;
 use bytes::Buf;
+use ascii::AsciiChar;
+use std::net::{SocketAddr, TcpListener, TcpStream, Shutdown};
 
-const ASCII_NEWLINE: u8 = 0x0A;
-const ASCII_RETURN: u8 = 0x0D;
-const ASCII_COLON: u8 = b':';
-const ASCII_SPACE: u8 = b' ';
-const ASCII_DASH: u8 = b'-';
+pub use http::{Request, Response, StatusCode, Method, HeaderName, HeaderValue, HeaderMap};
+pub use bytes::Bytes;
 
-use http::HeaderName;
-use http::HeaderValue;
-use http::Method;
-pub use http::{Request,Response,StatusCode};
+const MAX_LINE_LENGTH: u64 = 32768;
+const MAX_REQ_HEADER_COUNT: usize = 1024;
 
 pub struct Server {
-    listener: std::net::TcpListener,
-    callback: fn(std::net::TcpStream),
+    listener: TcpListener,
+    callback: fn(TcpStream),
 }
 
 
 impl Server {
 
-    pub fn new(bind_address: std::net::SocketAddr, connection_handler: fn(std::net::TcpStream)) -> Self {
-        Server {
-            listener: Server::socket(bind_address).into(),
-            callback: connection_handler,
+    pub fn new(bind_address: SocketAddr, connection_handler: fn(TcpStream)) -> Self {
+        match Server::socket(bind_address) {
+            Err(os_error) => {
+                panic!("{}", os_error);
+            }
+            Ok(socket) => {
+                Server {
+                    listener: socket.into(),
+                    callback: connection_handler,
+                }
+            }
         }
     }
 
-    fn socket(bind_address: std::net::SocketAddr) -> socket2::Socket {
-        let socket = socket2::Socket::new(socket2::Domain::IPV6, socket2::Type::STREAM, None).unwrap();
-        // TODO: error checking
-        let _ = socket.set_only_v6(false);
-        let _ = socket.bind(&bind_address.into());
-        let _ = socket.listen(128);
-        let _ = socket.set_reuse_address(true);
-        return socket;
+    fn socket(bind_address: SocketAddr) -> Result<socket2::Socket, std::io::Error> {
+        let socket = socket2::Socket::new(socket2::Domain::IPV6, socket2::Type::STREAM, None)?;
+        socket.set_only_v6(false)?;
+        socket.bind(&bind_address.into())?;
+        socket.listen(128)?;
+        socket.set_reuse_address(true)?;
+        return Ok(socket);
     }
 
     pub fn run(&mut self) -> Result<(), std::io::Error> {
         for res in self.listener.incoming() {
             match res {
                 Ok(stream) => (self.callback)(stream),
-                Err(error) => return Err(error),
+                Err(os_error) => return Err(os_error),
             }
         }
         return Err(std::io::Error::last_os_error());
@@ -54,14 +57,14 @@ impl Server {
 
 
 pub struct Connection {
-    stream: std::net::TcpStream,
-    callback: fn(http::Request<Bytes>)->http::Response<Bytes>,
+    stream: TcpStream,
+    callback: fn(Request<Bytes>)->Response<Bytes>,
 }
 
 
 impl Connection {
 
-    pub fn new(stream: std::net::TcpStream, request_handler: fn(http::Request<Bytes>)->http::Response<Bytes>) -> Self {
+    pub fn new(stream: TcpStream, request_handler: fn(Request<Bytes>)->Response<Bytes>) -> Self {
         Connection {
             stream,
             callback: request_handler,
@@ -70,109 +73,202 @@ impl Connection {
 
 
     pub fn run(&mut self) -> Result<(), std::io::Error> {
-        let mut reader = std::io::BufReader::new(self.stream.try_clone().unwrap());
+        let mut reader = BufReader::new(self.stream.try_clone().unwrap());
         loop {
-            // read requests from stream
-
-            let request_line = 
-            match read_line(&mut reader) {
-                Ok(line) => line,
-                Err(error) => {
-                    println!("read_line() {}", error);
+            // Read request from stream
+            let opt_request = match read_request(&mut reader) {
+                Ok(opt_request) => opt_request,
+                Err(status) => {
+                    // TODO: Generate error response
+                    println!("run() read_request returned {}", status);
                     break;
                 }
             };
 
-            match parse_request_line(&request_line) {
-                Err(status) => { 
-                    // TODO: generate error response
-                    println!("parse_request_line() {}", status);
-                    break; 
-                } 
-                Ok(mut req_builder) => {
-                    // Now read the request headers
-                    loop {
-                        let header_line = read_line(&mut reader).unwrap();
-                        println!("line={:?} len={}", header_line, header_line.len());
-                        if header_line.len() == 0 { break; } // End of headers
-                        match parse_header_line(&header_line) {
-                            Err(status) => { 
-                                // TODO: generate error response
-                                println!("parse_header_line() {}", status);
-                                break; 
-                            } 
-                            Ok((key,value)) => { 
-                                req_builder = req_builder.header(key, value); 
-                            }
-                        }
-                    }
+            // Check if we received a request
+            let request = match opt_request {
+                None => { break; } // Connection closed by peer
+                Some(request) => request,
+            };
 
-                    // Read the request body, if any
-                    // ...
+            // Did the client request Connection: Keep-Alive?
+            let keep_alive = keep_alive_requested(&request);
 
-                    let request = req_builder.body(Bytes::from("")).unwrap();
+            // Call request handler to get a Response
+            let mut response = (&self.callback)(request);
 
-                    let keep_alive =
-                    match request.headers().get(http::HeaderName::from_bytes(b"connection".as_slice()).unwrap()) {
-                        None => false,
-                        Some(connection) => {
-                            if connection.as_bytes().starts_with(b"keep-alive") { true }
-                            else { false }
-                        }
-                    };
-
-                    // Call request handler
-                    let mut response = (&self.callback)(request);
-
-                    // Add necessary headers if missing
-                    if keep_alive {
-                        patch_response(&mut response, "Connection", "Keep-Alive");
-                        patch_response(&mut response, "Keep-Alive", "timeout=30, max=1000");
-                    }
-                    let len = format!("{}", response.body().len());
-                    patch_response(&mut response, "Content-Length", len.as_str());
-                    patch_response(&mut response, "Content-Type", "text/html");
-
-                    // Write responses back to stream
-                    self.send_response(response);
-
-                    // Close connection unless client requested Connection: Keep-Alive
-                    if keep_alive == false { break; }
-                }
+            // Add necessary headers if missing
+            if keep_alive {
+                header_if_missing(&mut response, "Connection", "keep-alive");
+                header_if_missing(&mut response, "Keep-Alive", "timeout=30, max=1000");
             }
+            let len = format!("{}", response.body().len());
+            header_if_missing(&mut response, "Content-Length", len.as_str());
+            header_if_missing(&mut response, "Content-Type", "text/html; charset=utf-8");
+
+            // Write responses back to stream
+            println!("run() {:?}", response);
+            if let Err(os_error) = self.send_response(response) {
+                println!("run() send_response returned {}", os_error);
+                break;
+            }
+
+            // Close connection unless client requested Connection: Keep-Alive
+            if keep_alive == false { break; }
+
         }
-        return self.stream.shutdown(std::net::Shutdown::Both);
+        return self.stream.shutdown(Shutdown::Both);
     }
 
 
-    fn send_response(&mut self, response: Response<Bytes>) {
-        println!("response={:?}", response);
+    fn send_response(&mut self, response: Response<Bytes>) -> Result<(), std::io::Error> {
         let (parts, body) = response.into_parts();
-    
-        let status_line = format!("HTTP/1.1 {} {}\r\n", parts.status.as_str(), parts.status.canonical_reason().unwrap());
-        println!("status_line={:?}", status_line);
-        let _ = self.stream.write(status_line.as_bytes());
-    
-        for (key, value) in parts.headers.iter() {
+        self.send_response_status(&parts.status)?;
+        self.send_response_headers(&parts.headers)?;
+        self.send_response_body(body)?;
+        return Ok(());
+    }
+
+
+    fn send_response_status(&mut self, status: &StatusCode) -> Result<(), std::io::Error> {
+        let status_line = format!("HTTP/1.1 {} {}\r\n", status.as_str(), status.canonical_reason().unwrap());
+        self.stream.write(status_line.as_bytes())?;
+        return Ok(());
+    }
+
+
+    fn send_response_headers(&mut self, headers: &HeaderMap) -> Result<(), std::io::Error>{
+        for (key, value) in headers.iter() {
             let key = String::from_utf8(pretty_case(key).into()).unwrap();
             let header_line = format!("{}: {}\r\n", key, value.to_str().unwrap());
-            println!("header_line={:?}", header_line);
-            let _ = self.stream.write(header_line.as_bytes());
+            self.stream.write(header_line.as_bytes())?;
         }
         let empty_line = format!("\r\n");
-        let _ = self.stream.write(empty_line.as_bytes());
-    
-        println!("response body={:?}", body);
-    
-        let _ = std::io::copy(&mut body.reader(), &mut self.stream);
+        self.stream.write(empty_line.as_bytes())?;
+        return Ok(());
     }
-    
+
+
+    fn send_response_body(&mut self, body: Bytes) -> Result<(), std::io::Error> {
+        std::io::copy(&mut body.reader(), &mut self.stream)?;
+        return Ok(());
+    }
+
 }
 
 
-fn parse_request_line(request_line: &Bytes) -> Result<http::request::Builder, StatusCode> {
+fn keep_alive_requested(request: &Request<Bytes>) -> bool {
+    let key = HeaderName::from_bytes(b"connection".as_slice()).unwrap();
+    return match request.headers().get(key) {
+        None => false,
+        Some(connection) => {
+            if connection.as_bytes().to_ascii_lowercase().starts_with(b"keep-alive") { true }
+            else { false }
+        }
+    }
+}
+
+
+fn read_request(reader: &mut BufReader<TcpStream>) -> Result<Option<Request<Bytes>>, StatusCode> {
+    let mut req_builder = Request::builder();
+
+    // Get request line, e.g. "HTTP/1.1 GET /index.html"
+    let request_line = match read_line(reader) {
+        Err(os_error) => {
+            println!("read_request() read_line returned {}", os_error);
+            return Err(StatusCode::BAD_REQUEST);
+        }
+        Ok(line) => line,
+    };
+
+    // Connection closed by peer?
+    if request_line.len() == 0 { return Ok(None); } 
+    
+    req_builder = parse_request_line(req_builder, &request_line)?;
+    req_builder = read_request_headers(req_builder, reader)?;
+
+    let body = read_request_body(&req_builder, reader)?;
+    let request = finalize_request(req_builder, body)?;
+
+    return Ok(Some(request));
+}
+
+
+fn request_content_length(req_builder: &http::request::Builder) -> Option<usize> {
+    let key = "Content-Length";
+    let opt_value = req_builder.headers_ref().unwrap().get(key);
+    if let Some(value) = opt_value {
+        if let Ok(length) = value.to_str().unwrap().parse::<usize>() {
+            return Some(length);
+        }
+    }
+    return None;
+}
+
+
+fn read_request_body(req_builder: &http::request::Builder, reader: &mut BufReader<TcpStream>) -> Result<Bytes, StatusCode> {
+    let mut body = vec![];
+
+    if let Some(bytes_to_read) = request_content_length(req_builder) {
+        if bytes_to_read > 0 {
+            body = vec![0u8; bytes_to_read];
+            match reader.read_exact(&mut body) {
+                Err(os_error) => {
+                    println!("read_request_body() expected {} bytes, read_exact returned {}", bytes_to_read, os_error);
+                    return Err(StatusCode::BAD_REQUEST);
+                }
+                Ok(()) => {}
+            }
+        }
+    }
+
+    return Ok(Bytes::from(body));
+}
+
+
+fn finalize_request(req_builder: http::request::Builder, body: Bytes) -> Result<Request<Bytes>, StatusCode> {
+    let request = match req_builder.body(body) {
+        Ok(request) => request,
+        Err(error) => {
+            println!("finalize_request() http::request::Builder::body returned {}", error);
+            return Err(StatusCode::BAD_REQUEST);
+        }
+    };
+    return Ok(request);
+}
+
+
+fn read_request_headers(mut req_builder: http::request::Builder, reader: &mut BufReader<TcpStream>) -> Result<http::request::Builder, StatusCode>{
+    loop {
+        // Read next HTTP header "Key: Value"
+        let header_line = match read_line(reader) {
+            Ok(line) => line,
+            Err(os_error) => {
+                println!("read_request_headers() read_line returned {}", os_error);
+                return Err(StatusCode::BAD_REQUEST);
+            }
+        };
+
+        // Check for empty line (end of headers)
+        if header_line.len() == 0 { break; }
+
+        // Parse line into (HeaderName, HeaderValue) and add to Request
+        let (key, value) = parse_header_line(&header_line)?;
+        req_builder = req_builder.header(key, value); 
+
+        // Sanity check; stop if we receive an unreasonably large header
+        if req_builder.headers_ref().unwrap().len() > MAX_REQ_HEADER_COUNT {
+            println!("read_request_headers() exceeded {} headers", MAX_REQ_HEADER_COUNT);
+            return Err(StatusCode::BAD_REQUEST);
+        }
+    }
+    return Ok(req_builder);
+}
+
+
+fn parse_request_line(req_builder: http::request::Builder, request_line: &Bytes) -> Result<http::request::Builder, StatusCode> {
     if !request_line.is_ascii() { return Err(StatusCode::BAD_REQUEST); }
-    let parts = split(&request_line, ASCII_SPACE, 3);
+    let parts = split(&request_line, AsciiChar::Space.as_byte(), 3);
 
     // Verify we got three strings
     if parts.len() != 3 { 
@@ -180,17 +276,19 @@ fn parse_request_line(request_line: &Bytes) -> Result<http::request::Builder, St
     }
 
     // The first one should be a valid HTTP Method
-    let method = 
-    match Method::from_bytes(&parts[0]) {
+    let method = match Method::from_bytes(&parts[0]) {
         Err(_) => return Err(StatusCode::METHOD_NOT_ALLOWED),
         Ok(method) => method,
     };
 
     // Next is the URI, which can be more or less any contiguous ASCII imaginable
-    let uri: http::uri::PathAndQuery =
-    match std::str::from_utf8(&parts[1]) {
+    let uri: http::uri::PathAndQuery = match std::str::from_utf8(&parts[1]) {
         Ok(str) => str.parse().unwrap(),
-        Err(_) => return Err(StatusCode::BAD_REQUEST),
+        Err(error) => {
+            // Should be impossible because we already verified the line is ASCII
+            println!("parse_request_line() bad URI: {}", error);
+            return Err(StatusCode::BAD_REQUEST);
+        }
     };
 
     // Last string must be HTTP/1.1
@@ -199,23 +297,25 @@ fn parse_request_line(request_line: &Bytes) -> Result<http::request::Builder, St
         return Err(StatusCode::HTTP_VERSION_NOT_SUPPORTED);
     }
 
-    let request = Request::builder()
-        .method(method)
-        .uri(uri)
-        .version(http::Version::HTTP_11);
-
-    return Ok(request);
+    return Ok(req_builder.method(method).uri(uri).version(http::Version::HTTP_11));
 }
 
 
 fn parse_header_line(header_line: &Bytes) -> Result<(HeaderName, HeaderValue), StatusCode> {
-    let parts = split(&header_line, ASCII_SPACE, 2);
+    // Split in twain
+    let parts = split(&header_line, AsciiChar::Space.as_byte(), 2);
     if parts.len() != 2 { return Err(StatusCode::BAD_REQUEST); }
-    let key = match parts[0].strip_suffix(&[ASCII_COLON]) {
+
+    // First part is "Key:"
+    let key = match parts[0].strip_suffix(&[AsciiChar::Colon.as_byte()]) {
         None => return Err(StatusCode::BAD_REQUEST),
         Some(bytes) => HeaderName::from_bytes(bytes),
     };
+
+    // Second part is "Value"
     let value = HeaderValue::from_bytes(&parts[1]);
+
+    // Return tuple if both are okay, otherwise signal error
     return match (key,value) {
         (Ok(key), Ok(value)) => Ok((key, value)),
         (_, _) => Err(StatusCode::BAD_REQUEST),
@@ -223,6 +323,7 @@ fn parse_header_line(header_line: &Bytes) -> Result<(HeaderName, HeaderValue), S
 }
 
 
+// "content-type" -> "Content-Type" for readability and broken clients
 fn pretty_case(key: &HeaderName) -> Bytes {
     let mut result = BytesMut::new();
     let mut initial = true;
@@ -232,7 +333,7 @@ fn pretty_case(key: &HeaderName) -> Bytes {
             char = char.to_ascii_uppercase(); 
             initial = false;
         }
-        if char == ASCII_DASH {
+        if char == AsciiChar::Minus.as_byte() {
             initial = true;
         }
         result.extend_from_slice(&[char]);
@@ -241,7 +342,7 @@ fn pretty_case(key: &HeaderName) -> Bytes {
 }
 
 
-fn patch_response(response: &mut Response<Bytes>, key: &str, value: &str) {
+fn header_if_missing(response: &mut Response<Bytes>, key: &str, value: &str) {
     let key = HeaderName::from_bytes(key.as_bytes()).unwrap();
     let value = HeaderValue::from_bytes(value.as_bytes()).unwrap();
     if !response.headers().contains_key(&key) {
@@ -250,18 +351,16 @@ fn patch_response(response: &mut Response<Bytes>, key: &str, value: &str) {
 }
 
 
-fn read_line(reader: &mut std::io::BufReader<std::net::TcpStream>) -> Result<Bytes,String> {
+fn read_line(reader: &mut std::io::BufReader<std::net::TcpStream>) -> Result<Bytes,std::io::Error> {
     let mut buffer = vec![];
-    // TODO: read_until() blocks and allocates an arbitrarily large buffer,
-    // allowing an attacker to crash the server by sending an oversized line.
-    // Replace with something that enforces a reasonable limit.
-    return match reader.read_until(ASCII_NEWLINE, &mut buffer) {
+
+    return match reader.take(MAX_LINE_LENGTH).read_until(AsciiChar::LineFeed.as_byte(), &mut buffer) {
         Ok(_) => {
-            if buffer.ends_with(&[ASCII_NEWLINE]) { buffer.pop(); }
-            if buffer.ends_with(&[ASCII_RETURN]) { buffer.pop(); }
+            if buffer.ends_with(&[AsciiChar::LineFeed.as_byte()]) { buffer.pop(); }
+            if buffer.ends_with(&[AsciiChar::CarriageReturn.as_byte()]) { buffer.pop(); } 
             Ok(Bytes::from(buffer))
         }
-        Err(msg) => Err(format!("{}", msg)),
+        Err(os_error) => Err(os_error),
     }
 }
 
