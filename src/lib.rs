@@ -14,59 +14,49 @@ type ReqBuilder = http::request::Builder;
 const MAX_LINE_LENGTH: u64 = 32768;
 const MAX_REQ_HEADER_COUNT: usize = 1024;
 
+
+type ConnectionCallback = fn(TcpStream);
+
+
 pub struct Server {
     listener: TcpListener,
-    callback: fn(TcpStream),
+    callback: ConnectionCallback,
 }
 
 
 impl Server {
 
-    pub fn new(bind_address: SocketAddr, connection_handler: fn(TcpStream)) -> Self {
-        match Server::socket(bind_address) {
-            Err(os_error) => {
-                panic!("{}", os_error);
-            }
-            Ok(socket) => {
-                Server {
-                    listener: socket.into(),
-                    callback: connection_handler,
-                }
-            }
+    pub fn new(listener: TcpListener, connection_handler: ConnectionCallback) -> Self {
+        Server {
+            listener,
+            callback: connection_handler,
         }
-    }
-
-    fn socket(bind_address: SocketAddr) -> Result<socket2::Socket, std::io::Error> {
-        let socket = socket2::Socket::new(socket2::Domain::IPV6, socket2::Type::STREAM, None)?;
-        socket.set_only_v6(false)?;
-        socket.bind(&bind_address.into())?;
-        socket.listen(128)?;
-        socket.set_reuse_address(true)?;
-        return Ok(socket);
     }
 
     pub fn run(&mut self) -> Result<(), std::io::Error> {
-        for res in self.listener.incoming() {
-            match res {
-                Ok(stream) => (self.callback)(stream),
-                Err(os_error) => return Err(os_error),
-            }
+        println!("server listening for incoming connections");
+        loop {
+            let (stream, _peer) = self.listener.accept()?;
+            println!("listener returned something");
+            (&self.callback)(stream);
         }
-        return Err(std::io::Error::last_os_error());
     }
 
 }
 
 
+type RequestCallback = fn(Request<Bytes>) -> Response<Bytes>;
+
+
 pub struct Connection {
     stream: TcpStream,
-    callback: fn(Request<Bytes>)->Response<Bytes>,
+    callback: RequestCallback,
 }
 
 
 impl Connection {
 
-    pub fn new(stream: TcpStream, request_handler: fn(Request<Bytes>)->Response<Bytes>) -> Self {
+    pub fn new(stream: TcpStream, request_handler: RequestCallback) -> Self {
         Connection {
             stream,
             callback: request_handler,
@@ -110,7 +100,7 @@ impl Connection {
 
             // Write responses back to stream
             println!("run() {:?}", response);
-            if let Err(os_error) = self.send_response(response) {
+            if let Err(os_error) = send_response(response, &mut self.stream) {
                 println!("run() send_response returned {}", os_error);
                 break;
             }
@@ -123,43 +113,55 @@ impl Connection {
     }
 
 
-    fn send_response<T: Buf>(&mut self, response: Response<T>) -> Result<(), std::io::Error> {
-        let (parts, body) = response.into_parts();
-        self.send_response_status(&parts.status)?;
-        self.send_response_headers(&parts.headers)?;
-        self.send_response_body(body)?;
-        return Ok(());
-    }
-
-
-    fn send_response_status(&mut self, status: &StatusCode) -> Result<(), std::io::Error> {
-        let status_line = format!("HTTP/1.1 {} {}\r\n", status.as_str(), status.canonical_reason().unwrap());
-        self.stream.write(status_line.as_bytes())?;
-        return Ok(());
-    }
-
-
-    fn send_response_headers(&mut self, headers: &HeaderMap) -> Result<(), std::io::Error>{
-        for (key, value) in headers.iter() {
-            let key = String::from_utf8(pretty_case(key).into()).unwrap();
-            let header_line = format!("{}: {}\r\n", key, value.to_str().unwrap());
-            self.stream.write(header_line.as_bytes())?;
-        }
-        let empty_line = format!("\r\n");
-        self.stream.write(empty_line.as_bytes())?;
-        return Ok(());
-    }
-
-
-    fn send_response_body<T: Buf>(&mut self, body: T) -> Result<(), std::io::Error> {
-        std::io::copy(&mut body.reader(), &mut self.stream)?;
-        return Ok(());
-    }
-
 }
 
 
-fn keep_alive_requested(request: &Request<Bytes>) -> bool {
+pub fn send_response<T: Buf, W: Write>(response: Response<T>, writer: &mut W) -> Result<(), std::io::Error> {
+    let (parts, body) = response.into_parts();
+    send_response_status(&parts.status, writer)?;
+    send_response_headers(&parts.headers, writer)?;
+    send_response_body(body, writer)?;
+    return Ok(());
+}
+
+
+fn send_response_status<W: Write>(status: &StatusCode, writer: &mut W) -> Result<(), std::io::Error> {
+    let status_line = format!("HTTP/1.1 {} {}\r\n", status.as_str(), status.canonical_reason().unwrap());
+    writer.write(status_line.as_bytes())?;
+    return Ok(());
+}
+
+
+fn send_response_headers<W: Write>(headers: &HeaderMap, writer: &mut W) -> Result<(), std::io::Error>{
+    for (key, value) in headers.iter() {
+        let key = String::from_utf8(pretty_case(key).into()).unwrap();
+        let header_line = format!("{}: {}\r\n", key, value.to_str().unwrap());
+        writer.write(header_line.as_bytes())?;
+    }
+    let empty_line = format!("\r\n");
+    writer.write(empty_line.as_bytes())?;
+    return Ok(());
+}
+
+
+fn send_response_body<T: Buf, W: Write>(body: T, writer: &mut W) -> Result<(), std::io::Error> {
+    std::io::copy(&mut body.reader(), writer)?;
+    return Ok(());
+}
+
+
+
+pub fn listener(bind_address: SocketAddr) -> Result<TcpListener, std::io::Error> {
+    let socket = socket2::Socket::new(socket2::Domain::IPV6, socket2::Type::STREAM, None)?;
+    socket.set_only_v6(false)?;
+    socket.bind(&bind_address.into())?;
+    socket.listen(128)?;
+    socket.set_reuse_address(true)?;
+    return Ok(socket.into());
+}
+
+
+pub fn keep_alive_requested(request: &Request<Bytes>) -> bool {
     let key = HeaderName::from_bytes(b"connection".as_slice()).unwrap();
     return match request.headers().get(key) {
         None => false,
@@ -171,7 +173,7 @@ fn keep_alive_requested(request: &Request<Bytes>) -> bool {
 }
 
 
-fn read_request<R: BufRead>(reader: &mut R) -> Result<Option<Request<Bytes>>, StatusCode> {
+pub fn read_request<R: BufRead>(reader: &mut R) -> Result<Option<Request<Bytes>>, StatusCode> {
     let mut req_builder = Request::builder();
 
     // Get request line, e.g. "HTTP/1.1 GET /index.html"
@@ -344,7 +346,7 @@ fn pretty_case(key: &HeaderName) -> Bytes {
 }
 
 
-fn header_if_missing<T>(response: &mut Response<T>, key: &str, value: &str) {
+pub fn header_if_missing<T>(response: &mut Response<T>, key: &str, value: &str) {
     let key = HeaderName::from_bytes(key.as_bytes()).unwrap();
     let value = HeaderValue::from_bytes(value.as_bytes()).unwrap();
     if !response.headers().contains_key(&key) {
