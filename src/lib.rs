@@ -135,7 +135,7 @@ pub fn send_response<T: Buf, W: Write>(response: Response<T>, writer: &mut W) ->
 
 
 fn send_request_line<W: Write>(version: &Version, method: &Method, uri: &Uri, writer: &mut W) -> Result<(), std::io::Error> {
-    let request_line = format!("{:?} {:?} {:?}\r\n", version, method, uri);
+    let request_line = format!("{:?} {:?} {:?}\r\n", method, uri, version);
     writer.write(request_line.as_bytes())?;
     return Ok(());
 }
@@ -325,7 +325,10 @@ fn parse_request_line(req_builder: ReqBuilder, request_line: &Bytes) -> Result<R
 
     // Next is the URI, which can be more or less any contiguous ASCII imaginable
     let uri: http::uri::PathAndQuery = match std::str::from_utf8(&parts[1]) {
-        Ok(str) => str.parse().unwrap(),
+        Ok(str) => {
+            if str == "" { return Err(StatusCode::BAD_REQUEST); }
+            str.parse().unwrap() 
+        }
         Err(utf_error) => {
             // Should be impossible because we already verified the line is ASCII
             println!("parse_request_line() bad URI: {}", utf_error);
@@ -436,7 +439,7 @@ mod tests {
             &uri, 
             &mut buf,
         ).expect("send_request_line() failed");
-        assert_eq!(String::from_utf8(buf).unwrap(), String::from("HTTP/1.1 GET /foo\r\n"));
+        assert_eq!(String::from_utf8(buf).unwrap(), String::from("GET /foo HTTP/1.1\r\n"));
     }
 
     #[test]
@@ -470,6 +473,114 @@ mod tests {
             &mut buf,
         ).expect("send_body() failed");
         assert_eq!(String::from_utf8(buf).unwrap(), String::from("Hello world"));
+    }
+
+    #[test]
+    fn test_read_line() {
+        let mut reader: &[u8] = b"Hello world\r\n";
+        let line = read_line(&mut reader).expect("read_line() failed");
+        assert_eq!(String::from_utf8(line.to_vec()).unwrap(), String::from("Hello world"));
+    }
+
+    #[test]
+    fn test_read_line_empty() {
+        let mut reader: &[u8] = b"\r\n";
+        let line = read_line(&mut reader).expect("read_line() failed");
+        assert_eq!(String::from_utf8(line.to_vec()).unwrap(), String::from(""));
+    }
+
+    #[test]
+    fn test_read_line_malformed() {
+        let mut reader: &[u8] = b"\n";
+        let line = read_line(&mut reader).expect("read_line() failed");
+        assert_eq!(String::from_utf8(line.to_vec()).unwrap(), String::from(""));
+    }
+
+    #[test]
+    fn test_read_line_partial_1() {
+        let mut reader: &[u8] = b"Hello\r\nworld\r\n";
+        let line = read_line(&mut reader).expect("read_line() failed");
+        assert_eq!(String::from_utf8(line.to_vec()).unwrap(), String::from("Hello"));
+    }
+
+    #[test]
+    fn test_read_line_partial_2() {
+        let mut reader: &[u8] = b"Hello\r\nworld\r\n";
+        let _ = read_line(&mut reader).expect("read_line() failed");
+        let line = read_line(&mut reader).expect("read_line() failed");
+        assert_eq!(String::from_utf8(line.to_vec()).unwrap(), String::from("world"));
+    }
+
+    #[test]
+    fn test_parse_request_line_empty() {
+        let request_line = Bytes::from_static(b"");
+        let req_builder = Request::builder();
+        match parse_request_line(req_builder, &request_line) {
+            Err(status) => {
+                assert_eq!(status, StatusCode::BAD_REQUEST);    
+            }
+            Ok(_) => panic!("parse_request_line() should have returned an error"),
+        }
+    }
+
+    #[test]
+    fn test_parse_request_line_nonsense() {
+        let request_line = Bytes::from_static(b"Hello world");
+        let req_builder = Request::builder();
+        match parse_request_line(req_builder, &request_line) {
+            Err(status) => {
+                assert_eq!(status, StatusCode::BAD_REQUEST);    
+            }
+            Ok(_) => panic!("parse_request_line() should have returned an error"),
+        }
+    }
+
+    #[test]
+    fn test_parse_request_line_version_missing() {
+        let request_line = Bytes::from_static(b"GET /");
+        let req_builder = Request::builder();
+        match parse_request_line(req_builder, &request_line) {
+            Err(status) => {
+                assert_eq!(status, StatusCode::BAD_REQUEST);    
+            }
+            Ok(_) => panic!("parse_request_line() should have returned an error"),
+        }
+    }
+
+    #[test]
+    fn test_parse_request_line_newbie_mistake() {
+        let request_line = Bytes::from_static(b"HTTP/1.1 GET /");
+        let req_builder = Request::builder();
+        match parse_request_line(req_builder, &request_line) {
+            Err(status) => {
+                assert_eq!(status, StatusCode::METHOD_NOT_ALLOWED);    
+            }
+            Ok(_) => panic!("parse_request_line() should have returned an error"),
+        }
+    }
+
+    #[test]
+    fn test_parse_request_line_uri_space() {
+        let request_line = Bytes::from_static(b"GET /foo bar HTTP/1.1");
+        let req_builder = Request::builder();
+        match parse_request_line(req_builder, &request_line) {
+            Err(status) => {
+                assert_eq!(status, StatusCode::HTTP_VERSION_NOT_SUPPORTED);    
+            }
+            Ok(_) => panic!("parse_request_line() should have returned an error"),
+        }
+    }
+
+    #[test]
+    fn test_parse_request_line_http10() {
+        let request_line = Bytes::from_static(b"GET /foo HTTP/1.0");
+        let req_builder = Request::builder();
+        match parse_request_line(req_builder, &request_line) {
+            Err(status) => {
+                assert_eq!(status, StatusCode::HTTP_VERSION_NOT_SUPPORTED);    
+            }
+            Ok(_) => panic!("parse_request_line() should have returned an error"),
+        }
     }
 
 }
