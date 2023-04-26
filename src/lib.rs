@@ -6,7 +6,7 @@ use bytes::Buf;
 use ascii::AsciiChar;
 use std::net::{SocketAddr, TcpListener, TcpStream, Shutdown};
 
-pub use http::{Request, Response, StatusCode, Method, HeaderName, HeaderValue, HeaderMap};
+pub use http::{Request, Response, StatusCode, Version, Method, HeaderName, HeaderValue, HeaderMap, Uri};
 pub use bytes::Bytes;
 
 type ReqBuilder = http::request::Builder;
@@ -116,11 +116,27 @@ impl Connection {
 }
 
 
+pub fn send_request<T: Buf, W: Write>(request: Request<T>, writer: &mut W) -> Result<(), std::io::Error> {
+    let (parts, body) = request.into_parts();
+    send_request_line(&parts.version, &parts.method, &parts.uri, writer)?;
+    send_headers(&parts.headers, writer)?;
+    send_body(body, writer)?;
+    return Ok(());
+}
+
+
 pub fn send_response<T: Buf, W: Write>(response: Response<T>, writer: &mut W) -> Result<(), std::io::Error> {
     let (parts, body) = response.into_parts();
     send_response_status(&parts.status, writer)?;
-    send_response_headers(&parts.headers, writer)?;
-    send_response_body(body, writer)?;
+    send_headers(&parts.headers, writer)?;
+    send_body(body, writer)?;
+    return Ok(());
+}
+
+
+fn send_request_line<W: Write>(version: &Version, method: &Method, uri: &Uri, writer: &mut W) -> Result<(), std::io::Error> {
+    let request_line = format!("{:?} {:?} {:?}\r\n", version, method, uri);
+    writer.write(request_line.as_bytes())?;
     return Ok(());
 }
 
@@ -132,7 +148,7 @@ fn send_response_status<W: Write>(status: &StatusCode, writer: &mut W) -> Result
 }
 
 
-fn send_response_headers<W: Write>(headers: &HeaderMap, writer: &mut W) -> Result<(), std::io::Error>{
+fn send_headers<W: Write>(headers: &HeaderMap, writer: &mut W) -> Result<(), std::io::Error>{
     for (key, value) in headers.iter() {
         let key = String::from_utf8(pretty_case(key).into()).unwrap();
         let header_line = format!("{}: {}\r\n", key, value.to_str().unwrap());
@@ -144,11 +160,10 @@ fn send_response_headers<W: Write>(headers: &HeaderMap, writer: &mut W) -> Resul
 }
 
 
-fn send_response_body<T: Buf, W: Write>(body: T, writer: &mut W) -> Result<(), std::io::Error> {
+fn send_body<T: Buf, W: Write>(body: T, writer: &mut W) -> Result<(), std::io::Error> {
     std::io::copy(&mut body.reader(), writer)?;
     return Ok(());
 }
-
 
 
 pub fn listener(bind_address: SocketAddr) -> Result<TcpListener, std::io::Error> {
@@ -172,6 +187,29 @@ pub fn keep_alive_requested(request: &Request<Bytes>) -> bool {
     }
 }
 
+
+pub fn keep_alive_denied(response: &Response<Bytes>) -> bool {
+    let key = HeaderName::from_bytes(b"connection".as_slice()).unwrap();
+    return match response.headers().get(key) {
+        None => false,
+        Some(connection) => {
+            if connection.as_bytes().to_ascii_lowercase().starts_with(b"close") { true }
+            else { false }
+        }
+    }
+}
+
+
+pub fn keep_alive_granted(response: &Response<Bytes>) -> bool {
+    let key = HeaderName::from_bytes(b"connection".as_slice()).unwrap();
+    return match response.headers().get(key) {
+        None => false,
+        Some(connection) => {
+            if connection.as_bytes().to_ascii_lowercase().starts_with(b"keep-alive") { true }
+            else { false }
+        }
+    }
+}
 
 pub fn read_request<R: BufRead>(reader: &mut R) -> Result<Option<Request<Bytes>>, StatusCode> {
     let mut req_builder = Request::builder();
@@ -211,7 +249,7 @@ fn request_content_length(req_builder: &ReqBuilder) -> Option<usize> {
 
 
 fn read_request_body<R: BufRead>(req_builder: &ReqBuilder, reader: &mut R) -> Result<Bytes, StatusCode> {
-    let mut body = vec![];
+    let mut body: Vec<u8> = vec![];
 
     if let Some(bytes_to_read) = request_content_length(req_builder) {
         if bytes_to_read > 0 {
@@ -389,7 +427,49 @@ mod tests {
     use super::*;
 
     #[test]
-    fn it_works() {
-        assert_eq!(true, true);
+    fn test_send_request_line() {
+        let mut buf: Vec<u8> = vec![];
+        let uri = "/foo".parse::<http::uri::Uri>().unwrap();
+        send_request_line(
+            &http::Version::HTTP_11, 
+            &http::Method::GET, 
+            &uri, 
+            &mut buf,
+        ).expect("send_request_line() failed");
+        assert_eq!(String::from_utf8(buf).unwrap(), String::from("HTTP/1.1 GET /foo\r\n"));
     }
+
+    #[test]
+    fn test_send_response_status() {
+        let mut buf: Vec<u8> = vec![];
+        send_response_status(
+            &http::StatusCode::OK, 
+            &mut buf,
+        ).expect("send_response_status() failed");
+        assert_eq!(String::from_utf8(buf).unwrap(), String::from("HTTP/1.1 200 OK\r\n"));
+    }
+
+    #[test]
+    fn test_send_headers() {
+        let mut buf: Vec<u8> = vec![];
+        let mut headers = HeaderMap::new();
+        headers.insert(HeaderName::from_bytes(b"Connection").unwrap(), HeaderValue::from_bytes(b"close").unwrap());
+        send_headers(
+            &headers, 
+            &mut buf,
+        ).expect("send_headers() failed");
+        assert_eq!(String::from_utf8(buf).unwrap(), String::from("Connection: close\r\n\r\n"));
+    }
+
+    #[test]
+    fn test_send_body() {
+        let mut buf: Vec<u8> = vec![];
+        let body = Bytes::from_static(b"Hello world");
+        send_body(
+            body, 
+            &mut buf,
+        ).expect("send_body() failed");
+        assert_eq!(String::from_utf8(buf).unwrap(), String::from("Hello world"));
+    }
+
 }
