@@ -121,6 +121,7 @@ pub fn send_request<T: Buf, W: Write>(request: Request<T>, writer: &mut W) -> Re
     send_request_line(&parts.version, &parts.method, &parts.uri, writer)?;
     send_headers(&parts.headers, writer)?;
     send_body(body, writer)?;
+    writer.flush()?;
     return Ok(());
 }
 
@@ -130,6 +131,7 @@ pub fn send_response<T: Buf, W: Write>(response: Response<T>, writer: &mut W) ->
     send_response_status(&parts.status, writer)?;
     send_headers(&parts.headers, writer)?;
     send_body(body, writer)?;
+    writer.flush()?;
     return Ok(());
 }
 
